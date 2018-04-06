@@ -1,0 +1,797 @@
+#define NOMINMAX
+
+// API Abstraction
+#include "../APIAbstractionDefines.h"
+
+// Outer-Engine includes
+
+// Inter-Engine includes
+#include "../../Lua/LuaEnvironment.h"
+#include "../../Lua/EventGlue/EventDataCreators.h"
+
+#include "Render/ShaderActions/SetPerObjectGroupConstantsShaderAction.h"
+#include "Render/ShaderActions/SetPerFrameConstantsShaderAction.h"
+#include "../PrimeEngine/Render/ShaderActions/BindResourceToGPUPipelineShaderAction.h"
+// Sibling/Children includes
+#include "EffectManager.h"
+#include "Effect.h"
+
+namespace PE {
+
+using namespace Components;
+
+Handle EffectManager::s_myHandle;
+	
+EffectManager::EffectManager(PE::GameContext &context, PE::MemoryArena arena)
+	: m_map(context, arena, 128)
+	, m_additionalDepthMaps(context, arena, 16)
+	, m_pixelShaderSubstitutes(context, arena)
+	, m_pCurRenderTarget(NULL)
+	, m_pixelShaders(context, arena, 256)
+	, m_vertexShaders(context, arena, 256)
+#if APIABSTRACTION_D3D11
+		, m_cbuffers(context, arena, 64)
+	#endif
+	, m_depthStencilStates(context, arena, 16)
+	, m_blendStates(context, arena, 16)
+	, m_rasterizerStates(context, arena, 16)
+	, m_doMotionBlur(false)
+	, m_disableScreenSpaceEffects(false)
+	, m_glowSeparatedTextureGPU(context, arena)
+	, m_2ndGlowTargetTextureGPU(context, arena)
+	, m_shadowMapDepthTexture(context, arena)
+	, m_frameBufferCopyTexture(context, arena)
+{
+	m_arena = arena; m_pContext = &context;
+}
+void EffectManager::setupConstantBuffers()
+{
+#	if APIABSTRACTION_D3D9
+	/*
+		ID3D10Buffer *pBuf;
+		HRESULT hr;
+		D3D10_BUFFER_DESC cbDesc;
+		cbDesc.Usage = D3D10_USAGE_DYNAMIC; // can only write to it, can't read
+		cbDesc.BindFlags = D3D10_BIND_CONSTANT_BUFFER;
+		cbDesc.CPUAccessFlags = D3D10_CPU_ACCESS_WRITE; // make sure we can access it with cpu for writing only
+		cbDesc.MiscFlags = 0;
+		
+		cbDesc.ByteWidth = sizeof( SetPerFrameConstantsShaderAction );
+		hr = D3D9_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		hbuf = pBuf;
+		m_cbuffers.add("cbPerFrame", hbuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbPerObjectGroup_c1 );
+		hr = D3D9_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		hbuf = pBuf;
+		m_cbuffers.add("cbPerObjectGroup", hbuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbPerObject_c2 );
+		hr = D3D9_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		hbuf = pBuf;
+		m_cbuffers.add("cbPerObject", hbuf);
+
+		cbDesc.ByteWidth = sizeof( SetPerMaterialConstantsShaderAction );
+		hr = D3D9_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		hbuf = pBuf;
+		m_cbuffers.add("cbPerMaterial", hbuf);
+	*/
+#	elif APIABSTRACTION_D3D11
+		ID3D11Buffer *pBuf;
+		
+		HRESULT hr;
+		D3D11_BUFFER_DESC cbDesc;
+		cbDesc.Usage = D3D11_USAGE_DYNAMIC; // can only write to it, can't read
+		cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; // make sure we can access it with cpu for writing only
+		cbDesc.MiscFlags = 0;
+		
+		cbDesc.ByteWidth = sizeof( SetPerFrameConstantsShaderAction::Data );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf );
+		assert(SUCCEEDED(hr));
+		SetPerFrameConstantsShaderAction::s_pBuffer = pBuf;
+		
+		m_cbuffers.add("cbPerFrame", pBuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbPerObjectGroup_c1::Data );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		
+		hlsl_cbPerObjectGroup_c1::s_pBuffer = pBuf;
+		m_cbuffers.add("cbPerObjectGroup", pBuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbPerObject_c2::Data );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		hlsl_cbPerObject_c2::s_pBuffer = pBuf;
+		m_cbuffers.add("cbPerObject", pBuf);
+
+		cbDesc.ByteWidth = sizeof( SetPerMaterialConstantsShaderAction );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		SetPerMaterialConstantsShaderAction::s_pBuffer = pBuf;
+		m_cbuffers.add("cbPerMaterial", pBuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbMergeRods_c5 );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		m_cbuffers.add("cbMergeRods", pBuf);
+
+		cbDesc.ByteWidth = sizeof( hlsl_cbMergingState_c6 );
+		hr = D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateBuffer( &cbDesc, NULL, &pBuf);
+		assert(SUCCEEDED(hr));
+		m_cbuffers.add("cbMergingState", pBuf);
+#	endif
+}
+
+void EffectManager::setupDepthStencilStates()
+{
+#	if APIABSTRACTION_D3D9
+/*
+	D3D10_DEPTH_STENCIL_DESC dsDesc;
+
+	// Depth test parameters
+	dsDesc.DepthEnable = true;
+	dsDesc.DepthWriteMask = D3D10_DEPTH_WRITE_MASK_ALL;
+	dsDesc.DepthFunc = D3D10_COMPARISON_LESS_EQUAL;
+
+	// Stencil test parameters
+	dsDesc.StencilEnable = false;
+	//dsDesc.StencilReadMask = 0xFF;
+	//dsDesc.StencilWriteMask = 0xFF;
+
+	// Stencil operations if pixel is front-facing
+	//dsDesc.FrontFace.StencilFailOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.FrontFace.StencilDepthFailOp = D3D10_STENCIL_OP_INCR;
+	//dsDesc.FrontFace.StencilPassOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.FrontFace.StencilFunc = D3D10_COMPARISON_ALWAYS;
+
+	// Stencil operations if pixel is back-facing
+	//dsDesc.BackFace.StencilFailOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.BackFace.StencilDepthFailOp = D3D10_STENCIL_OP_DECR;
+	//dsDesc.BackFace.StencilPassOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.BackFace.StencilFunc = D3D10_COMPARISON_ALWAYS;
+
+	
+	// Create depth stencil state
+	ID3D10DepthStencilState * pDSState;
+	D3D9_GPUScreen::Instance()->m_pD3DDevice->CreateDepthStencilState(&dsDesc, &pDSState);
+
+	m_depthStencilStates.add("ZBuffer", pDSState);
+	*/
+#	elif APIABSTRACTION_D3D11
+	D3D11_DEPTH_STENCIL_DESC dsDesc;
+
+	// Depth test parameters
+	dsDesc.DepthEnable = true;
+	dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+	dsDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+
+	// Stencil test parameters
+	dsDesc.StencilEnable = false;
+	//dsDesc.StencilReadMask = 0xFF;
+	//dsDesc.StencilWriteMask = 0xFF;
+
+	// Stencil operations if pixel is front-facing
+	//dsDesc.FrontFace.StencilFailOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.FrontFace.StencilDepthFailOp = D3D10_STENCIL_OP_INCR;
+	//dsDesc.FrontFace.StencilPassOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.FrontFace.StencilFunc = D3D10_COMPARISON_ALWAYS;
+
+	// Stencil operations if pixel is back-facing
+	//dsDesc.BackFace.StencilFailOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.BackFace.StencilDepthFailOp = D3D10_STENCIL_OP_DECR;
+	//dsDesc.BackFace.StencilPassOp = D3D10_STENCIL_OP_KEEP;
+	//dsDesc.BackFace.StencilFunc = D3D10_COMPARISON_ALWAYS;
+
+	// Create depth stencil state
+	ID3D11DepthStencilState * pDSState;
+	D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateDepthStencilState(&dsDesc, &pDSState);
+
+	m_depthStencilStates.add("ZBuffer",pDSState);
+
+	dsDesc.DepthEnable = false;
+	D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateDepthStencilState(&dsDesc, &pDSState);
+	
+	m_depthStencilStates.add("NoZBuffer", pDSState);
+
+#	endif
+}
+void EffectManager::setupRasterizerStates()
+{
+#	if APIABSTRACTION_D3D9
+	
+#	elif APIABSTRACTION_D3D11
+	D3D11_RASTERIZER_DESC rasterizerState;
+	memset(&rasterizerState, 0, sizeof(rasterizerState));
+	rasterizerState.FillMode = D3D11_FILL_SOLID; //D3D11_FILL_WIREFRAME;
+	rasterizerState.CullMode = D3D11_CULL_NONE; //D3D11_CULL_FRONT;
+	rasterizerState.FrontCounterClockwise = true;
+	rasterizerState.DepthClipEnable = false;
+	/*
+	rasterizerState.DepthBias = false;
+	rasterizerState.DepthBiasClamp = 0;
+	rasterizerState.SlopeScaledDepthBias = 0;
+	rasterizerState.DepthClipEnable = true;
+	rasterizerState.ScissorEnable = true;
+	rasterizerState.MultisampleEnable = false;
+	rasterizerState.AntialiasedLineEnable = false;
+	*/
+	ID3D11RasterizerState * pRasterState;
+	D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateRasterizerState( &rasterizerState, &pRasterState );
+
+	m_rasterizerStates.add("SolidNoCull", pRasterState);
+#	endif
+}
+
+void EffectManager::setupSamplers()
+{
+#	if APIABSTRACTION_D3D9
+
+	SamplerState ss;
+	
+
+	ss.val_D3DSAMP_ADDRESSU = D3DTADDRESS_WRAP;
+	ss.val_D3DSAMP_ADDRESSV = D3DTADDRESS_WRAP;
+	ss.val_D3DSAMP_ADDRESSW = D3DTADDRESS_WRAP;
+		//D3DTADDRESS_WRAP          = 1,
+		//D3DTADDRESS_MIRROR        = 2,
+		//D3DTADDRESS_CLAMP         = 3,
+		//D3DTADDRESS_BORDER        = 4,
+		//D3DTADDRESS_MIRRORONCE    = 5,
+
+	ss.val_D3DSAMP_BORDERCOLOR = 0x00000000;
+
+	ss.val_D3DSAMP_MAGFILTER = D3DTEXF_LINEAR;
+	ss.val_D3DSAMP_MINFILTER = D3DTEXF_LINEAR;
+	ss.val_D3DSAMP_MIPFILTER = D3DTEXF_LINEAR;
+		//D3DTEXF_NONE              = 0,
+		//D3DTEXF_POINT             = 1,
+		//D3DTEXF_LINEAR            = 2,
+		//D3DTEXF_ANISOTROPIC       = 3,
+		//D3DTEXF_PYRAMIDALQUAD     = 6,
+		//D3DTEXF_GAUSSIANQUAD      = 7,
+		//D3DTEXF_CONVOLUTIONMONO   = 8,
+
+	ss.val_D3DSAMP_MIPMAPLODBIAS = 0;
+	ss.val_D3DSAMP_MAXMIPLEVEL = 0;
+	ss.val_D3DSAMP_MAXANISOTROPY = 1;
+	ss.val_D3DSAMP_SRGBTEXTURE = 0;
+	ss.val_D3DSAMP_ELEMENTINDEX = 0;
+	ss.val_D3DSAMP_DMAPOFFSET = 0;
+
+	m_samplerStates[CPU_SAMPLER_INDICES::TRILINEAR_SAMPLER_STATE_CPU_ID] = ss;
+
+	ss.val_D3DSAMP_ADDRESSU = D3DTADDRESS_CLAMP;
+	ss.val_D3DSAMP_ADDRESSV = D3DTADDRESS_CLAMP;
+	ss.val_D3DSAMP_ADDRESSW = D3DTADDRESS_CLAMP;
+
+	m_samplerStates[CPU_SAMPLER_INDICES::TRILINEAR_SAMPLER_CLAMP_STATE_CPU_ID] = ss;
+
+
+#	elif APIABSTRACTION_D3D11
+	D3D11_SAMPLER_DESC sdesc;
+	sdesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sdesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+	sdesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+	sdesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+
+	sdesc.MinLOD = 0;
+	sdesc.MaxLOD = FLT_MAX;
+
+	sdesc.MipLODBias = 0;
+
+	sdesc.MaxAnisotropy = 16;
+
+	//sdesc.ComparisonFunc = NULL;
+	memset(sdesc.BorderColor,0, sizeof(sdesc.BorderColor));
+
+	ID3D11SamplerState * pSampler;
+	D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateSamplerState( &sdesc, &pSampler );
+
+	m_samplerStates[CPU_SAMPLER_INDICES::TRILINEAR_SAMPLER_STATE_CPU_ID] = pSampler;
+
+	
+	D3D11_SAMPLER_DESC sdesc2;
+	sdesc2.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sdesc2.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sdesc2.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sdesc2.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+
+	sdesc2.MinLOD = 0;
+	sdesc2.MaxLOD = FLT_MAX;
+
+	sdesc2.MipLODBias = 0;
+
+	sdesc2.MaxAnisotropy = 16;
+
+	//sdesc2.ComparisonFunc = NULL;
+	memset(sdesc2.BorderColor,0, sizeof(sdesc2.BorderColor));
+
+	ID3D11SamplerState * pSampler2;
+	D3D11_GPUScreen::Instance()->m_pD3DDevice->CreateSamplerState( &sdesc2, &pSampler2 );
+
+	m_samplerStates[CPU_SAMPLER_INDICES::TRILINEAR_SAMPLER_CLAMP_STATE_CPU_ID] = pSampler2;
+
+
+#	endif
+}
+
+void EffectManager::createCustomDepthMap(const char *name)
+{
+	Handle h("TEXTURE_GPU", sizeof(TextureGPU));
+
+	TextureGPU *ptex = new(h) TextureGPU(*m_pContext, m_arena);
+
+	ptex->createDrawableIntoDepthTexture(GPUScreen::Instance()->getHeight(), GPUScreen::Instance()->getHeight());
+
+	m_additionalDepthMaps.add(name, h);
+
+}
+
+Handle EffectManager::getCustomDepthMap(const char *name)
+{
+	return m_additionalDepthMaps.findHandle(name);
+}
+
+void EffectManager::bindShadowMapToShadowMapSlot()
+{
+#if !APIABSTRACTION_OGL
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::SHADOWMAP_TEXTURE_2D_SAMPLER_SLOT, m_shadowMapDepthTexture.m_pTexture);
+#endif
+}
+
+void EffectManager::buildFullScreenBoard()
+{
+	//todo: use createBillboard() functionality of cpu buffers
+	PositionBufferCPU vbcpu(*m_pContext, m_arena);
+	vbcpu.m_values.reset(3 * 4);
+	vbcpu.m_values.add(-1.0f); vbcpu.m_values.add(-1.0f); vbcpu.m_values.add(0.0f);
+	vbcpu.m_values.add(1.0f); vbcpu.m_values.add(-1.0f); vbcpu.m_values.add(0.0f);
+	vbcpu.m_values.add(1.0f); vbcpu.m_values.add(1.0f); vbcpu.m_values.add(0.0f);
+	vbcpu.m_values.add(-1.0f); vbcpu.m_values.add(1.0f); vbcpu.m_values.add(0.0f);
+	
+	TexCoordBufferCPU tcbcpu(*m_pContext, m_arena);
+	tcbcpu.m_values.reset(2 * 4);
+	tcbcpu.m_values.add(0.0f); tcbcpu.m_values.add(1.0f);
+	tcbcpu.m_values.add(1.0f); tcbcpu.m_values.add(1.0f);
+	tcbcpu.m_values.add(1.0f); tcbcpu.m_values.add(0.0f);
+	tcbcpu.m_values.add(0.0f); tcbcpu.m_values.add(0.0f);
+
+	IndexBufferCPU ibcpu(*m_pContext, m_arena);
+	ibcpu.createBillboardCPUBuffer();
+
+	m_hVertexBufferGPU = Handle("VERTEX_BUFFER_GPU", sizeof(VertexBufferGPU));
+	VertexBufferGPU *pvbgpu = new(m_hVertexBufferGPU) VertexBufferGPU(*m_pContext, m_arena);
+	pvbgpu->createGPUBufferFromSource_ReducedMesh(vbcpu, tcbcpu);
+
+	m_hIndexBufferGPU = Handle("INDEX_BUFFER_GPU", sizeof(IndexBufferGPU));
+	IndexBufferGPU *pibgpu = new(m_hIndexBufferGPU) IndexBufferGPU(*m_pContext, m_arena);
+	pibgpu->createGPUBuffer(ibcpu);
+
+	m_hFirstGlowPassEffect = getEffectHandle("firstglowpass.fx");
+	m_hSecondGlowPassEffect = getEffectHandle("verticalblur.fx");
+	m_hGlowSeparationEffect = getEffectHandle("glowseparationpass.fx");
+	m_hMotionBlurEffect = getEffectHandle("motionblur.fx");
+	
+}
+
+void EffectManager::setFrameBufferCopyRenderTarget()
+{
+#		if APIABSTRACTION_D3D9
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_frameBufferCopyTexture, true);
+#		elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_frameBufferCopyTexture, true);
+#		endif
+}
+
+void EffectManager::endCurrentRenderTarget()
+{
+#	if APIABSTRACTION_D3D9
+	if (m_pCurRenderTarget)
+	{
+		D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+		m_pCurRenderTarget = NULL;
+	}
+#elif APIABSTRACTION_OGL
+	if (m_pCurRenderTarget)
+	{
+		OGL_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+		m_pCurRenderTarget = NULL;
+	}
+#endif
+}
+
+void EffectManager::setTextureAndDepthTextureRenderTargetForGlow()
+{
+#	if APIABSTRACTION_D3D9
+		if (m_pCurRenderTarget)
+		{
+			D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+			m_pCurRenderTarget = NULL;
+		}
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(m_hGlowTargetTextureGPU.getObject<TextureGPU>(), m_hGlowTargetTextureGPU.getObject<TextureGPU>(), true, true);
+		m_pCurRenderTarget = m_hGlowTargetTextureGPU.getObject<TextureGPU>();
+#	elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(m_hGlowTargetTextureGPU.getObject<TextureGPU>(), m_hGlowTargetTextureGPU.getObject<TextureGPU>(), true, true);
+#	endif
+
+}
+void EffectManager::setTextureAndDepthTextureRenderTargetForDefaultRendering()
+{
+#	if APIABSTRACTION_OGL
+	
+	// use device back buffer and depth
+	OGL_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(0, 0, true, true);
+
+#	elif APIABSTRACTION_D3D9
+
+	if (m_pCurRenderTarget)
+	{
+		D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+		m_pCurRenderTarget = NULL;
+	}
+	// use device back buffer and depth
+	D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(0, 0, true, true);
+
+#	elif APIABSTRACTION_D3D11
+		// use device back buffer and depth
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(0, 0, true, true);
+#	endif
+}
+
+
+void EffectManager::set2ndGlowRenderTarget()
+{
+#		if APIABSTRACTION_D3D9
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_2ndGlowTargetTextureGPU, true);
+#		elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_2ndGlowTargetTextureGPU, true);
+#		endif
+}
+
+
+
+void EffectManager::drawGlowSeparationPass()
+{
+
+	Effect &curEffect = *m_hGlowSeparationEffect.getObject<Effect>();
+
+	if (!curEffect.m_isReady)
+		return;
+
+#	if APIABSTRACTION_D3D9
+#		ifndef _XBOX
+			m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture->GenerateMipSubLevels();
+#		endif
+		if (m_pCurRenderTarget)
+		{
+			D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+			m_pCurRenderTarget = NULL;
+		}
+
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_glowSeparatedTextureGPU, true);
+		m_pCurRenderTarget = &m_glowSeparatedTextureGPU;
+#	elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->m_pD3DContext->GenerateMips(
+			m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_glowSeparatedTextureGPU, true);
+#	endif
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+	
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+	
+	PE::BindResourceToGpuPipelineShaderAction setTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, API_CHOOSE_DX11_DX9_OGL(m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_texture));
+	setTextureAction.bindToPipeline(&curEffect);
+	
+	PE::BindResourceToGpuPipelineShaderAction setDepthTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, API_CHOOSE_DX11_DX9_OGL(m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_texture));
+	setDepthTextureAction.bindToPipeline(&curEffect);
+#if 0
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pDepthShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+#elif APIABSTRACTION_OGL
+	PE::BindResourceToGpuPipelineShaderAction setTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_texture);
+	setTextureAction.bindToPipeline(&curEffect);
+	PE::BindResourceToGpuPipelineShaderAction setDepthTextureAction(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_texture);
+	setDepthTextureAction.bindToPipeline(&curEffect);
+#endif
+#endif
+	pibGPU->draw();
+#if 0
+#if APIABSTRACTION_D3D11 | APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+#endif
+	setTextureAction.unbindFromPipeline(&curEffect);
+	setDepthTextureAction.unbindFromPipeline(&curEffect);
+}
+
+
+void EffectManager::drawFirstGlowPass()
+{
+	Effect &curEffect = *m_hFirstGlowPassEffect.getObject<Effect>();
+
+	if (!curEffect.m_isReady)
+		return;
+
+#	if APIABSTRACTION_D3D9
+		if (m_pCurRenderTarget)
+		{
+			D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+			m_pCurRenderTarget = NULL;
+		}
+
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&m_2ndGlowTargetTextureGPU, true);
+		m_pCurRenderTarget = &m_2ndGlowTargetTextureGPU;
+#	elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(&this->m_2ndGlowTargetTextureGPU, true);
+#	endif
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+	
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+#if 0
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_glowSeparatedTextureGPU.m_pShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_glowSeparatedTextureGPU.m_pTexture);
+#endif
+#endif
+
+	PE::BindResourceToGpuPipelineShaderAction setTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, API_CHOOSE_DX11_DX9_OGL(m_glowSeparatedTextureGPU.m_pShaderResourceView, m_glowSeparatedTextureGPU.m_pTexture, m_glowSeparatedTextureGPU.m_texture));
+	setTextureAction.bindToPipeline(&curEffect);
+
+	pibGPU->draw();
+#if 0
+#if APIABSTRACTION_D3D9 | APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+#endif
+	setTextureAction.unbindFromPipeline(&curEffect);
+}
+
+void EffectManager::drawSecondGlowPass()
+{
+	Effect &curEffect = *m_hSecondGlowPassEffect.getObject<Effect>();
+	if (!curEffect.m_isReady)
+		return;
+
+#	if APIABSTRACTION_D3D9
+		if (m_pCurRenderTarget)
+		{
+			D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+			m_pCurRenderTarget = NULL;
+		}
+
+		D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>(), true);
+		m_pCurRenderTarget = m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>();
+#	elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithNoDepth(m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>(), true);
+#	endif
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+	
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+
+	PE::BindResourceToGpuPipelineShaderAction setBlurTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_BLUR_TEXTURE_2D_SAMPLER_SLOT, API_CHOOSE_DX11_DX9_OGL(m_2ndGlowTargetTextureGPU.m_pShaderResourceView, m_2ndGlowTargetTextureGPU.m_pTexture, m_2ndGlowTargetTextureGPU.m_texture));
+	setBlurTextureAction.bindToPipeline(&curEffect);
+
+	PE::BindResourceToGpuPipelineShaderAction setTextureAction(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, API_CHOOSE_DX11_DX9_OGL(m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_texture));
+	setTextureAction.bindToPipeline(&curEffect);
+
+	// the effect blurs vertically the horizontally blurred glow and adds it to source
+#if 0
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_BLUR_TEXTURE_2D_SAMPLER_SLOT, m_2ndGlowTargetTextureGPU.m_pShaderResourceView);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_BLUR_TEXTURE_2D_SAMPLER_SLOT, m_2ndGlowTargetTextureGPU.m_pTexture);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+#endif
+#endif
+	pibGPU->draw();
+#if 0
+#if APIABSTRACTION_D3D9 | APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_BLUR_TEXTURE_2D_SAMPLER_SLOT, 0);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+#endif
+	setBlurTextureAction.unbindFromPipeline(&curEffect);
+	setTextureAction.unbindFromPipeline(&curEffect);
+}
+
+void EffectManager::drawMotionBlur_EndScene()
+{
+	Effect &curEffect = *m_hMotionBlurEffect.getObject<Effect>();
+	if (!curEffect.m_isReady)
+		return;
+
+#	if APIABSTRACTION_D3D9
+	if (m_pCurRenderTarget)
+	{
+		D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+		m_pCurRenderTarget = NULL;
+	}
+
+	D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(0, 0, true, true);
+	// this is called in function above: GPUScreen::Instance()->getDevice()->BeginScene();
+#	elif APIABSTRACTION_D3D11
+		D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth();
+#	endif
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+	
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pDepthShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+
+#endif
+	SetPerObjectGroupConstantsShaderAction cb;
+	cb.m_data.gPreviousViewProjMatrix = m_previousViewProjMatrix;
+	cb.m_data.gViewProjInverseMatrix = m_currentViewProjMatrix.inverse();
+	cb.m_data.gDoMotionBlur = m_doMotionBlur;
+
+	cb.bindToPipeline();
+
+#if APIABSTRACTION_D3D9
+	// testing
+	SetPerFrameConstantsShaderAction cb0;
+	static int c = 0;
+	c++;
+	cb0.m_data.gGameTime = c / 100.0f;
+	cb0.bindToPipeline();
+#endif
+
+	pibGPU->draw();
+	m_previousViewProjMatrix = m_currentViewProjMatrix;
+
+#if APIABSTRACTION_D3D9 | APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+
+#if APIABSTRACTION_D3D9
+	GPUScreen::Instance()->getDevice()->EndScene();
+#endif
+	
+}
+
+void EffectManager::drawFrameBufferCopy()
+{
+	Effect &curEffect = *m_hMotionBlurEffect.getObject<Effect>();
+
+	if (!curEffect.m_isReady)
+		return;
+
+	setFrameBufferCopyRenderTarget();
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+	
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pDepthShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+#endif
+	SetPerObjectGroupConstantsShaderAction cb;
+	cb.m_data.gPreviousViewProjMatrix = m_previousViewProjMatrix;
+	cb.m_data.gViewProjInverseMatrix = m_currentViewProjMatrix.inverse();
+	cb.m_data.gDoMotionBlur = m_doMotionBlur;
+
+	cb.bindToPipeline();
+
+	pibGPU->draw();
+	m_previousViewProjMatrix = m_currentViewProjMatrix;
+
+#if APIABSTRACTION_D3D9 | APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+	
+}
+
+Effect *EffectManager::operator[] (const char *pEffectFilename)
+{
+	return m_map.findHandle(pEffectFilename).getObject<Effect>();
+}
+
+
+void EffectManager::debugDrawRenderTarget_EndScene(bool drawGlowRenderTarget, bool drawSeparatedGlow, bool drawGlow1stPass, bool drawGlow2ndPass, bool drawShadowRenderTarget)
+{
+	// use motion blur for now since it doesnt do anything but draws the surface
+	Effect &curEffect = *m_hMotionBlurEffect.getObject<Effect>();
+	if (!curEffect.m_isReady)
+		return;
+
+#	if APIABSTRACTION_D3D9
+	if (m_pCurRenderTarget)
+	{
+		D3D9_GPUScreen::Instance()->endRenderTarget(m_pCurRenderTarget);
+		m_pCurRenderTarget = NULL;
+	}
+
+	D3D9_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth(0, 0, true, true);
+	// this is called in function above: GPUScreen::Instance()->getDevice()->BeginScene();
+#	elif APIABSTRACTION_D3D11
+	D3D11_GPUScreen::Instance()->setRenderTargetsAndViewportWithDepth();
+#	endif
+
+	IndexBufferGPU *pibGPU = m_hIndexBufferGPU.getObject<IndexBufferGPU>();
+	pibGPU->setAsCurrent();
+
+	m_hVertexBufferGPU.getObject<VertexBufferGPU>()->setAsCurrent(&curEffect);
+
+	curEffect.setCurrent();
+#if APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pShaderResourceView);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pDepthShaderResourceView);
+#elif APIABSTRACTION_D3D9
+	if (drawGlowRenderTarget)
+		Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	if (drawSeparatedGlow)
+		Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_glowSeparatedTextureGPU.m_pTexture);
+	if (drawGlow1stPass)
+		Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_2ndGlowTargetTextureGPU.m_pTexture);
+	if (drawGlow2ndPass)
+		Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_hFinishedGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	if (drawShadowRenderTarget)
+		Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, m_shadowMapDepthTexture.m_pTexture);
+
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, m_hGlowTargetTextureGPU.getObject<TextureGPU>()->m_pTexture);
+	
+
+#endif
+	SetPerObjectGroupConstantsShaderAction cb;
+	cb.m_data.gPreviousViewProjMatrix = m_previousViewProjMatrix;
+	cb.m_data.gViewProjInverseMatrix = m_currentViewProjMatrix.inverse();
+	cb.m_data.gDoMotionBlur = m_doMotionBlur;
+
+	cb.bindToPipeline();
+
+	pibGPU->draw();
+	m_previousViewProjMatrix = m_currentViewProjMatrix;
+
+#if APIABSTRACTION_D3D9 | APIABSTRACTION_D3D11
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DIFFUSE_TEXTURE_2D_SAMPLER_SLOT, 0);
+	Effect::setResourceValue(GPU_RESOURCE_SLOTS::DEPTHMAP_TEXTURE_2D_SAMPLER_SLOT, 0);
+#endif
+
+#if APIABSTRACTION_D3D9
+	GPUScreen::Instance()->getDevice()->EndScene();
+#endif
+
+}
+
+
+}; // namespace PE
